@@ -1,0 +1,95 @@
+name: test
+on: [push, workflow_dispatch]
+jobs:
+  run:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # = bash -eo pipefail
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax + shellcheck
+        run: |
+          bash -n wireguard-vps.sh
+          shellcheck -S warning wireguard-vps.sh
+      - name: help
+        run: bash wireguard-vps.sh --help
+      - name: bad input is refused
+        run: |
+          if sudo bash wireguard-vps.sh --clients abc --yes; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --port 99999 --yes; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --subnet 10.8.0.0/16 --yes; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --add-client 'bad name'; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --endpoint 'a;b' --yes; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --list-clients; then echo 'expected a failure'; exit 1; fi   # nothing set up yet
+      - name: kernel module available?
+        run: |
+          if sudo modprobe wireguard; then echo "WG_FLAGS=" >> "$GITHUB_ENV"; echo "WG_STARTED=1" >> "$GITHUB_ENV"
+          else echo "no wireguard module: testing with --no-start"; echo "WG_FLAGS=--no-start" >> "$GITHUB_ENV"; echo "WG_STARTED=0" >> "$GITHUB_ENV"; fi
+      - name: turn on ufw (to test the port opening)
+        run: |
+          sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ufw
+          sudo ufw allow 22/tcp && sudo ufw --force enable
+      - name: full setup
+        run: sudo bash wireguard-vps.sh --clients 3 --endpoint 203.0.113.10 --qr --yes $WG_FLAGS
+      - name: checks
+        run: |
+          sudo test -s /etc/wireguard/server.key
+          for c in client1 client2 client3; do sudo test -s /etc/wireguard/clients/$c.conf; done
+          sudo grep -q 'Endpoint = 203.0.113.10:51820' /etc/wireguard/clients/client1.conf
+          test "$(sudo grep -c '^\[Peer\]' /etc/wireguard/wg0.conf)" = 3
+          test "$(sysctl -n net.ipv4.ip_forward)" = 1
+          grep -qx 'net.ipv4.ip_forward = 1' /etc/sysctl.d/99-wireguard-vps.conf   # persistent (runners with Docker already have 1)
+          sudo grep -q 'MASQUERADE' /etc/wireguard/wg0.conf
+          sudo ufw status | grep '51820/udp.*ALLOW' > /dev/null
+          test "$(sudo stat -c %a /etc/wireguard/server.key)" = 600
+          if [ "$WG_STARTED" = 1 ]; then
+            sudo wg show wg0
+            test "$(sudo wg show wg0 peers | wc -l)" = 3
+            sudo iptables -t nat -S POSTROUTING | grep -- '-s 10.8.0.0/24 .*MASQUERADE' > /dev/null
+            systemctl is-enabled wg-quick@wg0
+          fi
+      - name: second run is safe (keys and clients kept)
+        run: |
+          before="$(sudo sha256sum /etc/wireguard/server.key /etc/wireguard/clients/client1.conf)"
+          sudo bash wireguard-vps.sh --clients 3 --yes $WG_FLAGS
+          test "$before" = "$(sudo sha256sum /etc/wireguard/server.key /etc/wireguard/clients/client1.conf)"
+          test "$(sudo grep -c '^\[Peer\]' /etc/wireguard/wg0.conf)" = 3
+      - name: add / remove clients
+        run: |
+          sudo bash wireguard-vps.sh --add-client phone --qr
+          sudo test -s /etc/wireguard/clients/phone.conf
+          sudo grep -q 'Address = 10.8.0.5/32' /etc/wireguard/clients/phone.conf
+          sudo bash wireguard-vps.sh --remove-client client2
+          if sudo test -e /etc/wireguard/clients/client2.conf; then echo 'expected a failure'; exit 1; fi
+          if sudo grep -q 'client: client2' /etc/wireguard/wg0.conf; then echo 'expected a failure'; exit 1; fi
+          if sudo bash wireguard-vps.sh --remove-client client2; then echo 'expected a failure'; exit 1; fi
+          sudo bash wireguard-vps.sh --add-client laptop
+          sudo grep -q 'Address = 10.8.0.3/32' /etc/wireguard/clients/laptop.conf   # freed address is reused
+          sudo bash wireguard-vps.sh --list-clients | tee /tmp/list.txt
+          test "$(wc -l < /tmp/list.txt)" = 4
+          sudo wg-quick strip wg0 > /dev/null
+          if [ "$WG_STARTED" = 1 ]; then test "$(sudo wg show wg0 peers | wc -l)" = 4; fi
+      - name: end-to-end tunnel + NAT (client in a network namespace)
+        if: env.WG_STARTED == '1'
+        run: |
+          set -x
+          sudo ip netns add cl
+          sudo ip link add veth-s type veth peer name veth-c
+          sudo ip link set veth-c netns cl
+          sudo ip addr add 192.0.2.1/24 dev veth-s && sudo ip link set veth-s up
+          sudo ip -n cl addr add 192.0.2.2/24 dev veth-c && sudo ip -n cl link set veth-c up && sudo ip -n cl link set lo up
+          sudo sed 's/^Endpoint = .*/Endpoint = 192.0.2.1:51820/' /etc/wireguard/clients/phone.conf > /tmp/phone.conf
+          sudo wg-quick strip /tmp/phone.conf > /tmp/phone.wg
+          addr="$(awk '/^Address/{print $3}' /tmp/phone.conf)"
+          sudo ip -n cl link add wgc type wireguard
+          sudo ip netns exec cl wg setconf wgc /tmp/phone.wg
+          sudo ip -n cl addr add "$addr" dev wgc && sudo ip -n cl link set wgc up
+          sudo ip -n cl route add default dev wgc
+          sudo ip netns exec cl ping -c 3 -W 3 10.8.0.1
+          sudo ip netns exec cl curl -4 -sS --max-time 20 -o /dev/null -w '%{http_code}\n' https://1.1.1.1/
+          sudo wg show wg0 latest-handshakes
