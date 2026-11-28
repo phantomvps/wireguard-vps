@@ -70,9 +70,9 @@ log of each run shows which path ran. Debian 12 / 13 are supported by the script
 
 ## Need a server?
 
-Maintained by the team behind [PhantomVPS](https://phantomvps.com): VPS and dedicated servers with root access,
+Maintained by the team behind [PhantomVPS](https://phantomvps.com?ref=github): VPS and dedicated servers with root access,
 no ID documents, paid with Monero, Bitcoin, Litecoin, USDT, USDC, SOL or TRX.
-See [VPS for your own VPN](https://phantomvps.com/vpn-vps).
+See [VPS for your own VPN](https://phantomvps.com/vpn-vps?ref=github).
 
 ## License
 
